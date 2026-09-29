@@ -74,6 +74,8 @@ class LiteRtSession private constructor(
     }
 
     companion object {
+        private const val MAX_NUM_TOKENS = 4096
+
         /** 重いので IO スレッドで呼ぶ */
         @OptIn(ExperimentalApi::class)
         fun open(file: File, backend: BackendType, cacheDir: File, systemPrompt: String): LiteRtSession {
@@ -90,6 +92,9 @@ class LiteRtSession private constructor(
                     modelPath = file.absolutePath,
                     backend = backendOf(backend),
                     visionBackend = if (supportsImages) backendOf(backend) else null,
+                    // 省略するとモデルが対応する最大長の分の KV キャッシュを確保して CPU の読み込みが遅くなる。
+                    // GPU はエンジン側で 4096 に抑えられるので、それに揃える
+                    maxNumTokens = MAX_NUM_TOKENS,
                     cacheDir = cacheDir.path,
                 )
             )

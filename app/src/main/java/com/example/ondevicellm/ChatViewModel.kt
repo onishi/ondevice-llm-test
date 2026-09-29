@@ -65,12 +65,23 @@ data class ChatUiState(
 
 class PendingImage(val preview: Bitmap, val jpeg: ByteArray)
 
+/**
+ * 読み込んだエンジンは Activity / ViewModel ではなくプロセスに持たせる。
+ * 戻るボタンや履歴からのスワイプで画面が破棄されても、プロセスが残っていれば読み込み直さずに済む
+ */
+private object SessionHolder {
+    var session: LlmSession? = null
+    var ready: ModelState.Ready? = null
+}
+
 class ChatViewModel(app: Application) : AndroidViewModel(app) {
 
     private val _state = MutableStateFlow(ChatUiState())
     val state: StateFlow<ChatUiState> = _state.asStateFlow()
 
-    private var session: LlmSession? = null
+    private var session: LlmSession?
+        get() = SessionHolder.session
+        set(value) { SessionHolder.session = value }
     private var generationJob: Job? = null
     private var nextId = 0L
     @Volatile private var cancelRequested = false
@@ -88,16 +99,26 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             it.copy(
                 systemPrompt = prefs.getString(KEY_SYSTEM_PROMPT, null)
                     ?.takeUnless { saved -> saved in LEGACY_DEFAULT_SYSTEM_PROMPTS }
-                    ?: DEFAULT_SYSTEM_PROMPT
+                    ?: DEFAULT_SYSTEM_PROMPT,
+                preferredBackend = prefs.getString(KEY_BACKEND, null)
+                    ?.let { name -> BackendType.entries.firstOrNull { b -> b.name == name } }
+                    ?: BackendType.GPU,
             )
         }
         refreshModels()
-        // 前回使ったモデル、なければモデルファイルが 1 つだけのときにそれを読み込む
-        val models = _state.value.availableModels
-        val lastUsed = prefs.getString(KEY_LAST_MODEL, null)
-        when {
-            lastUsed == GEMINI_NANO_NAME -> loadGeminiNano()
-            else -> (models.firstOrNull { it.name == lastUsed } ?: models.singleOrNull())?.let { loadModel(it) }
+        // 同じプロセスで読み込み済みなら使い回す (画面側の会話は消えているので、エンジン側の履歴も捨てる)
+        val alive = SessionHolder.ready
+        if (alive != null && session != null) {
+            _state.update { it.copy(modelState = alive) }
+            resetConversation()
+        } else {
+            // 前回使ったモデル、なければモデルファイルが 1 つだけのときにそれを読み込む
+            val models = _state.value.availableModels
+            val lastUsed = prefs.getString(KEY_LAST_MODEL, null)
+            when {
+                lastUsed == GEMINI_NANO_NAME -> loadGeminiNano()
+                else -> (models.firstOrNull { it.name == lastUsed } ?: models.singleOrNull())?.let { loadModel(it) }
+            }
         }
     }
 
@@ -110,6 +131,13 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun setPreferredBackend(backend: BackendType) {
+        prefs.edit().putString(KEY_BACKEND, backend.name).apply()
+        // GPU を明示的に選び直したら、以前 GPU で失敗した記録を忘れてもう一度試す
+        if (backend == BackendType.GPU) {
+            val editor = prefs.edit()
+            prefs.all.keys.filter { it.startsWith(KEY_GPU_FAILED) }.forEach { editor.remove(it) }
+            editor.apply()
+        }
         _state.update { it.copy(preferredBackend = backend) }
         val current = _state.value.modelState
         if (current is ModelState.Ready && current.file != null && current.backend != backend.name) {
@@ -162,7 +190,10 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun loadModel(file: File) {
+        // GPU の初期化に失敗したことのあるモデルは、毎回 GPU で失敗するのを待たずに最初から CPU で開く
+        val gpuFailedKey = KEY_GPU_FAILED + file.name + ":" + file.length()
         val backend = _state.value.preferredBackend
+            .let { if (it == BackendType.GPU && prefs.getBoolean(gpuFailedKey, false)) BackendType.CPU else it }
         open(file.name, backend.name, file) {
             val cacheDir = getApplication<Application>().cacheDir
             val systemPrompt = _state.value.systemPrompt
@@ -172,6 +203,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                         // GPU が使えない端末では CPU にフォールバック
                         if (backend != BackendType.GPU) throw e
                         Log.w(TAG, "GPU init failed, falling back to CPU", e)
+                        prefs.edit().putBoolean(gpuFailedKey, true).apply()
                         LiteRtSession.open(file, BackendType.CPU, cacheDir, systemPrompt) to BackendType.CPU
                     }
                     .getOrThrow()
@@ -203,6 +235,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                 it.copy(modelState = ModelState.Loading(name, backendLabel), messages = emptyList())
             }
             withContext(Dispatchers.IO) {
+                SessionHolder.ready = null
                 session?.close()
                 session = null
             }
@@ -211,15 +244,17 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                 .onSuccess { (opened, label) ->
                     session = opened
                     prefs.edit().putString(KEY_LAST_MODEL, name).apply()
+                    val ready = ModelState.Ready(
+                        name = name,
+                        backend = label,
+                        loadMillis = System.currentTimeMillis() - start,
+                        supportsImages = opened.supportsImages,
+                        file = file,
+                    )
+                    SessionHolder.ready = ready
                     _state.update {
                         it.copy(
-                            modelState = ModelState.Ready(
-                                name = name,
-                                backend = label,
-                                loadMillis = System.currentTimeMillis() - start,
-                                supportsImages = opened.supportsImages,
-                                file = file,
-                            ),
+                            modelState = ready,
                             pendingImage = it.pendingImage.takeIf { opened.supportsImages },
                         )
                     }
@@ -343,16 +378,17 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    /** エンジンは SessionHolder に残して次の画面で使い回すので、ここでは生成を止めるだけ */
     override fun onCleared() {
         session?.cancel()
-        session?.close()
-        session = null
     }
 
     companion object {
         private const val TAG = "OnDeviceLlm"
         private const val KEY_SYSTEM_PROMPT = "system_prompt"
         private const val KEY_LAST_MODEL = "last_model"
+        private const val KEY_BACKEND = "backend"
+        private const val KEY_GPU_FAILED = "gpu_failed:"
         private const val MAX_IMAGE_SIDE = 1024
         const val GEMINI_NANO_NAME = "Gemini Nano"
     }
