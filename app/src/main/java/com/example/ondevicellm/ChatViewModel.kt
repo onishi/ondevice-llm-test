@@ -29,6 +29,8 @@ data class ChatMessage(
     val streaming: Boolean = false,
     val stats: String? = null,
     val image: Bitmap? = null,
+    /** モデルの読み込みが終わるのを待っている応答 */
+    val queued: Boolean = false,
 )
 
 sealed interface ModelState {
@@ -65,6 +67,9 @@ data class ChatUiState(
 
 class PendingImage(val preview: Bitmap, val jpeg: ByteArray)
 
+/** 読み込み中に送られた発話。読み込みが終わったら生成を始める */
+private class QueuedSend(val prompt: String, val image: PendingImage?, val replyId: Long)
+
 /**
  * 読み込んだエンジンは Activity / ViewModel ではなくプロセスに持たせる。
  * 戻るボタンや履歴からのスワイプで画面が破棄されても、プロセスが残っていれば読み込み直さずに済む
@@ -83,6 +88,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         get() = SessionHolder.session
         set(value) { SessionHolder.session = value }
     private var generationJob: Job? = null
+    private var queuedSend: QueuedSend? = null
     private var nextId = 0L
     @Volatile private var cancelRequested = false
 
@@ -232,7 +238,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch {
             generationJob?.join()
             _state.update {
-                it.copy(modelState = ModelState.Loading(name, backendLabel), messages = emptyList())
+                it.copy(modelState = ModelState.Loading(name, backendLabel), messages = emptyList(), generating = false)
             }
             withContext(Dispatchers.IO) {
                 SessionHolder.ready = null
@@ -258,10 +264,22 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                             pendingImage = it.pendingImage.takeIf { opened.supportsImages },
                         )
                     }
+                    // 読み込み中に送られていた発話があれば、ここで生成を始める
+                    queuedSend?.let { q ->
+                        queuedSend = null
+                        updateReply(q.replyId) { it.copy(queued = false) }
+                        generate(q.prompt, q.image?.takeIf { opened.supportsImages }, q.replyId)
+                    }
                 }
                 .onFailure { e ->
                     Log.e(TAG, "load failed", e)
-                    _state.update { it.copy(modelState = ModelState.Error("読み込みに失敗: ${e.message}")) }
+                    queuedSend?.let { q ->
+                        queuedSend = null
+                        updateReply(q.replyId) {
+                            it.copy(role = Role.ERROR, text = "モデルを読み込めなかったので応答できませんでした", streaming = false, queued = false)
+                        }
+                    }
+                    _state.update { it.copy(modelState = ModelState.Error("読み込みに失敗: ${e.message}"), generating = false) }
                 }
         }
     }
@@ -305,18 +323,26 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         val image = _state.value.pendingImage
         val prompt = text.trim().ifEmpty { if (image != null) "この画像について教えてください。" else "" }
         if (prompt.isEmpty() || _state.value.generating) return
-        if (_state.value.modelState !is ModelState.Ready) return
+        val loading = _state.value.modelState is ModelState.Loading
+        if (_state.value.modelState !is ModelState.Ready && !loading) return
 
         val userMsg = ChatMessage(nextId++, Role.USER, prompt, image = image?.preview)
         val replyId = nextId++
         _state.update {
             it.copy(
-                messages = it.messages + userMsg + ChatMessage(replyId, Role.MODEL, "", streaming = true),
+                messages = it.messages + userMsg + ChatMessage(replyId, Role.MODEL, "", streaming = true, queued = loading),
                 generating = true,
                 pendingImage = null,
             )
         }
+        if (loading) {
+            queuedSend = QueuedSend(prompt, image, replyId)
+        } else {
+            generate(prompt, image, replyId)
+        }
+    }
 
+    private fun generate(prompt: String, image: PendingImage?, replyId: Long) {
         cancelRequested = false
         generationJob = viewModelScope.launch {
             val current = session ?: return@launch
@@ -347,6 +373,12 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun stopGeneration() {
+        // 読み込み待ちの発話は、応答の枠ごと取り消す
+        queuedSend?.let { q ->
+            queuedSend = null
+            _state.update { s -> s.copy(messages = s.messages.filterNot { it.id == q.replyId }, generating = false) }
+            return
+        }
         if (!_state.value.generating) return
         cancelRequested = true
         session?.cancel()

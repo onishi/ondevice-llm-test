@@ -221,7 +221,9 @@ fun ChatScreen(vm: ChatViewModel = viewModel()) {
             }
 
             InputBar(
-                enabled = state.modelState is ModelState.Ready,
+                // 読み込み中も入力・送信できる (送った発話は読み込みが終わってから処理する)
+                enabled = state.modelState is ModelState.Ready || state.modelState is ModelState.Loading,
+                loading = state.modelState is ModelState.Loading,
                 imagesSupported = (state.modelState as? ModelState.Ready)?.supportsImages == true,
                 pendingImage = state.pendingImage?.preview,
                 generating = state.generating,
@@ -425,7 +427,13 @@ private fun MessageBubble(msg: ChatMessage) {
                     Text(msg.text, color = fg)
                 }
             } else if (msg.streaming && msg.text.isEmpty()) {
-                CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp, color = fg)
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp, color = fg)
+                    if (msg.queued) {
+                        Spacer(Modifier.size(8.dp))
+                        Text("モデルの読み込みを待っています…", color = fg, style = MaterialTheme.typography.bodySmall)
+                    }
+                }
             } else {
                 SelectionContainer {
                     if (msg.role == Role.MODEL) {
@@ -480,6 +488,7 @@ private fun displayText(msg: ChatMessage): String {
 @Composable
 private fun InputBar(
     enabled: Boolean,
+    loading: Boolean,
     imagesSupported: Boolean,
     pendingImage: Bitmap?,
     generating: Boolean,
@@ -545,6 +554,7 @@ private fun InputBar(
                 Text(
                     when {
                         !enabled -> "モデルを読み込んでください"
+                        loading -> "読み込み中も入力できます"
                         pendingImage != null -> "画像について質問 (空欄でも送れます)"
                         else -> "メッセージを入力"
                     }
