@@ -1,12 +1,15 @@
 package com.example.ondevicellm
 
 import android.content.ClipData
+import android.graphics.Bitmap
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Arrangement
@@ -19,6 +22,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.imePadding
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.widthIn
@@ -29,8 +33,19 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Send
+import androidx.compose.material.icons.filled.AddComment
+import androidx.compose.material.icons.filled.AddPhotoAlternate
+import androidx.compose.material.icons.filled.Bolt
+import androidx.compose.material.icons.filled.Check
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.ContentCopy
+import androidx.compose.material.icons.filled.EditNote
+import androidx.compose.material.icons.filled.FileOpen
+import androidx.compose.material.icons.filled.Memory
 import androidx.compose.material.icons.filled.MoreVert
+import androidx.compose.material.icons.filled.PhotoCamera
+import androidx.compose.material.icons.filled.PhotoLibrary
+import androidx.compose.material.icons.filled.SmartToy
 import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
@@ -60,12 +75,16 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.ClipEntry
 import androidx.compose.ui.platform.LocalClipboard
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.core.content.FileProvider
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import java.io.File
@@ -99,6 +118,19 @@ fun ChatScreen(vm: ChatViewModel = viewModel()) {
         uri?.let(vm::importModel)
     }
 
+    // カメラアプリに撮影を頼み、FileProvider 経由で cache/photos/ に書いてもらう
+    val context = LocalContext.current
+    val photoUri = remember {
+        val file = File(context.cacheDir, "photos/capture.jpg").apply { parentFile?.mkdirs() }
+        FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", file)
+    }
+    val takePicture = rememberLauncherForActivityResult(ActivityResultContracts.TakePicture()) { ok ->
+        if (ok) vm.attachImage(photoUri)
+    }
+    val pickImage = rememberLauncherForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri ->
+        uri?.let(vm::attachImage)
+    }
+
     Scaffold(
         topBar = {
             TopAppBar(
@@ -120,26 +152,40 @@ fun ChatScreen(vm: ChatViewModel = viewModel()) {
                     }
                     DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
                         DropdownMenuItem(
-                            text = { Text("モデルを選択") },
-                            onClick = { menuOpen = false; vm.refreshModels(); showModelDialog = true },
-                        )
-                        DropdownMenuItem(
-                            text = { Text("ファイルから取り込む") },
-                            onClick = { menuOpen = false; picker.launch(arrayOf("*/*")) },
-                        )
-                        DropdownMenuItem(
-                            text = { Text("システムプロンプト") },
-                            onClick = { menuOpen = false; showPromptDialog = true },
-                        )
-                        DropdownMenuItem(
-                            text = { Text("会話をリセット") },
+                            text = { Text("新しい会話") },
+                            leadingIcon = { Icon(Icons.Default.AddComment, contentDescription = null) },
                             enabled = state.modelState is ModelState.Ready,
                             onClick = { menuOpen = false; vm.resetConversation() },
                         )
                         HorizontalDivider()
+                        DropdownMenuItem(
+                            text = { Text("モデルを選択") },
+                            leadingIcon = { Icon(Icons.Default.SmartToy, contentDescription = null) },
+                            onClick = { menuOpen = false; vm.refreshModels(); showModelDialog = true },
+                        )
+                        DropdownMenuItem(
+                            text = { Text("ファイルから取り込む") },
+                            leadingIcon = { Icon(Icons.Default.FileOpen, contentDescription = null) },
+                            onClick = { menuOpen = false; picker.launch(arrayOf("*/*")) },
+                        )
+                        DropdownMenuItem(
+                            text = { Text("システムプロンプト") },
+                            leadingIcon = { Icon(Icons.Default.EditNote, contentDescription = null) },
+                            onClick = { menuOpen = false; showPromptDialog = true },
+                        )
+                        HorizontalDivider()
                         BackendType.entries.forEach { b ->
                             DropdownMenuItem(
-                                text = { Text((if (state.preferredBackend == b) "✓ " else "   ") + "バックエンド: $b") },
+                                text = { Text("バックエンド: $b") },
+                                leadingIcon = {
+                                    Icon(
+                                        if (b == BackendType.GPU) Icons.Default.Bolt else Icons.Default.Memory,
+                                        contentDescription = null,
+                                    )
+                                },
+                                trailingIcon = {
+                                    if (state.preferredBackend == b) Icon(Icons.Default.Check, contentDescription = "選択中")
+                                },
                                 onClick = { menuOpen = false; vm.setPreferredBackend(b) },
                             )
                         }
@@ -165,8 +211,8 @@ fun ChatScreen(vm: ChatViewModel = viewModel()) {
                     EmptyState(
                         state = state,
                         pushDir = vm.externalModelDir?.absolutePath ?: "",
-                        onSelect = { vm.refreshModels(); showModelDialog = true },
                         onLoad = vm::loadModel,
+                        onLoadGeminiNano = vm::loadGeminiNano,
                         onImport = { picker.launch(arrayOf("*/*")) },
                     )
                 } else {
@@ -176,9 +222,16 @@ fun ChatScreen(vm: ChatViewModel = viewModel()) {
 
             InputBar(
                 enabled = state.modelState is ModelState.Ready,
+                imagesSupported = (state.modelState as? ModelState.Ready)?.supportsImages == true,
+                pendingImage = state.pendingImage?.preview,
                 generating = state.generating,
                 onSend = vm::send,
                 onStop = vm::stopGeneration,
+                onTakePhoto = { takePicture.launch(photoUri) },
+                onPickPhoto = {
+                    pickImage.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
+                },
+                onClearImage = vm::clearImage,
             )
         }
     }
@@ -196,21 +249,30 @@ fun ChatScreen(vm: ChatViewModel = viewModel()) {
             onDismissRequest = { showModelDialog = false },
             title = { Text("モデルを選択") },
             text = {
-                if (state.availableModels.isEmpty()) {
-                    Text("*.litertlm が見つかりません。\n\nadb push するか、メニューの「ファイルから取り込む」を使ってください。")
-                } else {
-                    Column {
-                        state.availableModels.forEach { f ->
-                            TextButton(
-                                onClick = { showModelDialog = false; vm.loadModel(f) },
+                Column {
+                    TextButton(
+                        onClick = { showModelDialog = false; vm.loadGeminiNano() },
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        Text("Gemini Nano  (端末内蔵 · AICore)", modifier = Modifier.fillMaxWidth())
+                    }
+                    state.availableModels.forEach { f ->
+                        TextButton(
+                            onClick = { showModelDialog = false; vm.loadModel(f) },
+                            modifier = Modifier.fillMaxWidth(),
+                        ) {
+                            Text(
+                                "${f.name}  (${"%.2f".format(f.length() / 1e9)} GB)",
                                 modifier = Modifier.fillMaxWidth(),
-                            ) {
-                                Text(
-                                    "${f.name}  (${"%.2f".format(f.length() / 1e9)} GB)",
-                                    modifier = Modifier.fillMaxWidth(),
-                                )
-                            }
+                            )
                         }
+                    }
+                    if (state.availableModels.isEmpty()) {
+                        Spacer(Modifier.height(8.dp))
+                        Text(
+                            "*.litertlm は見つかりません。adb push するか、メニューの「ファイルから取り込む」を使ってください。",
+                            style = MaterialTheme.typography.bodySmall,
+                        )
                     }
                 }
             },
@@ -257,7 +319,7 @@ private fun SystemPromptDialog(initial: String, onDismiss: () -> Unit, onSave: (
 private fun statusText(ms: ModelState): String = when (ms) {
     ModelState.NotLoaded -> "モデル未読み込み"
     is ModelState.Copying -> "取り込み中 ${(ms.progress * 100).toInt()}%: ${ms.name}"
-    is ModelState.Loading -> "読み込み中 (${ms.backend}): ${ms.name}"
+    is ModelState.Loading -> "読み込み中 (${ms.detail}): ${ms.name}"
     is ModelState.Ready -> "${ms.name} · ${ms.backend} · load ${"%.1f".format(ms.loadMillis / 1000.0)}s"
     is ModelState.Error -> ms.message
 }
@@ -266,8 +328,8 @@ private fun statusText(ms: ModelState): String = when (ms) {
 private fun EmptyState(
     state: ChatUiState,
     pushDir: String,
-    onSelect: () -> Unit,
     onLoad: (File) -> Unit,
+    onLoadGeminiNano: () -> Unit,
     onImport: () -> Unit,
 ) {
     Column(
@@ -289,29 +351,26 @@ private fun EmptyState(
                     Text(ms.message, color = MaterialTheme.colorScheme.error)
                     Spacer(Modifier.height(16.dp))
                 }
-                if (state.availableModels.isNotEmpty()) {
-                    Text("使うモデルを選んでください", style = MaterialTheme.typography.titleMedium)
-                    Spacer(Modifier.height(16.dp))
-                    state.availableModels.forEach { f ->
-                        Button(onClick = { onLoad(f) }, modifier = Modifier.fillMaxWidth()) {
-                            Text("${f.name}  (${"%.2f".format(f.length() / 1e9)} GB)")
-                        }
-                        Spacer(Modifier.height(8.dp))
+                Text("使うモデルを選んでください", style = MaterialTheme.typography.titleMedium)
+                Spacer(Modifier.height(16.dp))
+                Button(onClick = onLoadGeminiNano, modifier = Modifier.fillMaxWidth()) {
+                    Text("Gemini Nano  (端末内蔵)")
+                }
+                Spacer(Modifier.height(8.dp))
+                state.availableModels.forEach { f ->
+                    Button(onClick = { onLoad(f) }, modifier = Modifier.fillMaxWidth()) {
+                        Text("${f.name}  (${"%.2f".format(f.length() / 1e9)} GB)")
                     }
-                    TextButton(onClick = onImport) { Text("ファイルから取り込む") }
-                    return@Column
+                    Spacer(Modifier.height(8.dp))
                 }
-                Text("LiteRT-LM 形式 (.litertlm) のモデルを用意してください", style = MaterialTheme.typography.titleMedium)
-                Spacer(Modifier.height(12.dp))
-                Text("adb で次の場所に push:", style = MaterialTheme.typography.bodyMedium)
-                SelectionContainer {
-                    Text(pushDir, fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.bodySmall)
+                if (state.availableModels.isEmpty()) {
+                    Spacer(Modifier.height(12.dp))
+                    Text("LiteRT-LM 形式 (.litertlm) のモデルは adb で次の場所に push:", style = MaterialTheme.typography.bodyMedium)
+                    SelectionContainer {
+                        Text(pushDir, fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.bodySmall)
+                    }
                 }
-                Spacer(Modifier.height(20.dp))
-                Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                    Button(onClick = onSelect) { Text("モデルを選択") }
-                    Button(onClick = onImport) { Text("ファイルから取り込む") }
-                }
+                TextButton(onClick = onImport) { Text("ファイルから取り込む") }
             }
         }
     }
@@ -353,7 +412,19 @@ private fun MessageBubble(msg: ChatMessage) {
                 .background(bg, RoundedCornerShape(16.dp))
                 .padding(horizontal = 14.dp, vertical = 10.dp)
         ) {
-            if (msg.streaming && msg.text.isEmpty()) {
+            if (msg.image != null) {
+                Column(horizontalAlignment = Alignment.End) {
+                    Image(
+                        msg.image.asImageBitmap(),
+                        contentDescription = "添付した画像",
+                        modifier = Modifier
+                            .widthIn(max = 220.dp)
+                            .clip(RoundedCornerShape(10.dp)),
+                    )
+                    Spacer(Modifier.height(8.dp))
+                    Text(msg.text, color = fg)
+                }
+            } else if (msg.streaming && msg.text.isEmpty()) {
                 CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp, color = fg)
             } else {
                 SelectionContainer {
@@ -407,19 +478,78 @@ private fun displayText(msg: ChatMessage): String {
 }
 
 @Composable
-private fun InputBar(enabled: Boolean, generating: Boolean, onSend: (String) -> Unit, onStop: () -> Unit) {
+private fun InputBar(
+    enabled: Boolean,
+    imagesSupported: Boolean,
+    pendingImage: Bitmap?,
+    generating: Boolean,
+    onSend: (String) -> Unit,
+    onStop: () -> Unit,
+    onTakePhoto: () -> Unit,
+    onPickPhoto: () -> Unit,
+    onClearImage: () -> Unit,
+) {
     var text by remember { mutableStateOf("") }
+    var attachMenuOpen by remember { mutableStateOf(false) }
+    if (pendingImage != null) {
+        Box(Modifier.padding(start = 12.dp, top = 8.dp)) {
+            Image(
+                pendingImage.asImageBitmap(),
+                contentDescription = "添付する画像",
+                contentScale = ContentScale.Crop,
+                modifier = Modifier
+                    .size(72.dp)
+                    .clip(RoundedCornerShape(8.dp)),
+            )
+            FilledIconButton(
+                onClick = onClearImage,
+                modifier = Modifier
+                    .align(Alignment.TopEnd)
+                    .offset(x = 8.dp, y = (-8).dp)
+                    .size(24.dp),
+            ) {
+                Icon(Icons.Default.Close, contentDescription = "画像を外す", modifier = Modifier.size(14.dp))
+            }
+        }
+    }
     Row(
         Modifier
             .fillMaxWidth()
             .padding(8.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
+        if (imagesSupported) {
+            Box {
+                IconButton(onClick = { attachMenuOpen = true }, enabled = enabled && !generating) {
+                    Icon(Icons.Default.AddPhotoAlternate, contentDescription = "画像を添付")
+                }
+                DropdownMenu(expanded = attachMenuOpen, onDismissRequest = { attachMenuOpen = false }) {
+                    DropdownMenuItem(
+                        text = { Text("カメラで撮る") },
+                        leadingIcon = { Icon(Icons.Default.PhotoCamera, contentDescription = null) },
+                        onClick = { attachMenuOpen = false; onTakePhoto() },
+                    )
+                    DropdownMenuItem(
+                        text = { Text("写真を選ぶ") },
+                        leadingIcon = { Icon(Icons.Default.PhotoLibrary, contentDescription = null) },
+                        onClick = { attachMenuOpen = false; onPickPhoto() },
+                    )
+                }
+            }
+        }
         OutlinedTextField(
             value = text,
             onValueChange = { text = it },
             enabled = enabled,
-            placeholder = { Text(if (enabled) "メッセージを入力" else "モデルを読み込んでください") },
+            placeholder = {
+                Text(
+                    when {
+                        !enabled -> "モデルを読み込んでください"
+                        pendingImage != null -> "画像について質問 (空欄でも送れます)"
+                        else -> "メッセージを入力"
+                    }
+                )
+            },
             modifier = Modifier.weight(1f),
             maxLines = 5,
         )
@@ -431,7 +561,7 @@ private fun InputBar(enabled: Boolean, generating: Boolean, onSend: (String) -> 
         } else {
             FilledIconButton(
                 onClick = { onSend(text); text = "" },
-                enabled = enabled && text.isNotBlank(),
+                enabled = enabled && (text.isNotBlank() || pendingImage != null),
             ) {
                 Icon(Icons.AutoMirrored.Filled.Send, contentDescription = "送信")
             }

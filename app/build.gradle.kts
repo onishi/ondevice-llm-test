@@ -44,6 +44,7 @@ kotlin {
 
 dependencies {
     implementation("com.google.ai.edge.litertlm:litertlm-android:0.17.1")
+    implementation("com.google.mlkit:genai-prompt:1.0.0-beta4")
 
     implementation(platform("androidx.compose:compose-bom:2026.03.01"))
     implementation("androidx.compose.ui:ui")

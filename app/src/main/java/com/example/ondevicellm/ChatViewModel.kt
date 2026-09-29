@@ -1,19 +1,13 @@
 package com.example.ondevicellm
 
 import android.app.Application
+import android.graphics.Bitmap
+import android.graphics.ImageDecoder
 import android.net.Uri
 import android.provider.OpenableColumns
 import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
-import com.google.ai.edge.litertlm.Backend
-import com.google.ai.edge.litertlm.Contents
-import com.google.ai.edge.litertlm.Conversation
-import com.google.ai.edge.litertlm.ConversationConfig
-import com.google.ai.edge.litertlm.Engine
-import com.google.ai.edge.litertlm.EngineConfig
-import com.google.ai.edge.litertlm.SamplerConfig
-import com.google.ai.edge.litertlm.ThinkingConfig
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -23,7 +17,7 @@ import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import kotlin.random.Random
+import java.io.ByteArrayOutputStream
 import java.io.File
 
 enum class Role { USER, MODEL, ERROR }
@@ -34,19 +28,29 @@ data class ChatMessage(
     val text: String,
     val streaming: Boolean = false,
     val stats: String? = null,
+    val image: Bitmap? = null,
 )
-
-enum class BackendType { GPU, CPU }
 
 sealed interface ModelState {
     data object NotLoaded : ModelState
     data class Copying(val name: String, val progress: Float) : ModelState
-    data class Loading(val name: String, val backend: BackendType) : ModelState
-    data class Ready(val name: String, val backend: BackendType, val loadMillis: Long) : ModelState
+    data class Loading(val name: String, val detail: String) : ModelState
+    data class Ready(
+        val name: String,
+        /** "GPU" "CPU" "AICore · nano-v3" など */
+        val backend: String,
+        val loadMillis: Long,
+        val supportsImages: Boolean,
+        /** モデルファイルで動いているとき、そのファイル (Gemini Nano なら null) */
+        val file: File?,
+    ) : ModelState
     data class Error(val message: String) : ModelState
 }
 
-const val DEFAULT_SYSTEM_PROMPT = "あなたは親切なアシスタントです。日本語で答えてください。"
+const val DEFAULT_SYSTEM_PROMPT = "あなたは親切なアシスタントです。日本語で簡潔に答えてください。絵文字の使用は控えてください。"
+
+/** 以前のデフォルト。これが保存されていたら「未編集」とみなして今のデフォルトを使う */
+private val LEGACY_DEFAULT_SYSTEM_PROMPTS = setOf("あなたは親切なアシスタントです。日本語で答えてください。")
 
 data class ChatUiState(
     val modelState: ModelState = ModelState.NotLoaded,
@@ -55,18 +59,18 @@ data class ChatUiState(
     val messages: List<ChatMessage> = emptyList(),
     val generating: Boolean = false,
     val systemPrompt: String = DEFAULT_SYSTEM_PROMPT,
+    /** 次の発話に添付する画像 */
+    val pendingImage: PendingImage? = null,
 )
+
+class PendingImage(val preview: Bitmap, val jpeg: ByteArray)
 
 class ChatViewModel(app: Application) : AndroidViewModel(app) {
 
     private val _state = MutableStateFlow(ChatUiState())
     val state: StateFlow<ChatUiState> = _state.asStateFlow()
 
-    // ネイティブ呼び出しは直列化する
-    private val engineDispatcher = Dispatchers.IO.limitedParallelism(1)
-
-    private var engine: Engine? = null
-    private var conversation: Conversation? = null
+    private var session: LlmSession? = null
     private var generationJob: Job? = null
     private var nextId = 0L
     @Volatile private var cancelRequested = false
@@ -81,13 +85,20 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
 
     init {
         _state.update {
-            it.copy(systemPrompt = prefs.getString(KEY_SYSTEM_PROMPT, null) ?: DEFAULT_SYSTEM_PROMPT)
+            it.copy(
+                systemPrompt = prefs.getString(KEY_SYSTEM_PROMPT, null)
+                    ?.takeUnless { saved -> saved in LEGACY_DEFAULT_SYSTEM_PROMPTS }
+                    ?: DEFAULT_SYSTEM_PROMPT
+            )
         }
         refreshModels()
-        // 前回使ったモデル、なければモデルが 1 つだけのときにそれを読み込む
+        // 前回使ったモデル、なければモデルファイルが 1 つだけのときにそれを読み込む
         val models = _state.value.availableModels
         val lastUsed = prefs.getString(KEY_LAST_MODEL, null)
-        (models.firstOrNull { it.name == lastUsed } ?: models.singleOrNull())?.let { loadModel(it) }
+        when {
+            lastUsed == GEMINI_NANO_NAME -> loadGeminiNano()
+            else -> (models.firstOrNull { it.name == lastUsed } ?: models.singleOrNull())?.let { loadModel(it) }
+        }
     }
 
     fun refreshModels() {
@@ -101,8 +112,8 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     fun setPreferredBackend(backend: BackendType) {
         _state.update { it.copy(preferredBackend = backend) }
         val current = _state.value.modelState
-        if (current is ModelState.Ready && current.backend != backend) {
-            _state.value.availableModels.firstOrNull { it.name == current.name }?.let { loadModel(it) }
+        if (current is ModelState.Ready && current.file != null && current.backend != backend.name) {
+            loadModel(current.file)
         }
     }
 
@@ -151,90 +162,133 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun loadModel(file: File) {
-        stopGeneration()
         val backend = _state.value.preferredBackend
-        viewModelScope.launch {
-            _state.update {
-                it.copy(modelState = ModelState.Loading(file.name, backend), messages = emptyList())
-            }
-            val result = withContext(engineDispatcher) {
-                releaseEngine()
-                runCatching { initEngine(file, backend) }
+        open(file.name, backend.name, file) {
+            val cacheDir = getApplication<Application>().cacheDir
+            val systemPrompt = _state.value.systemPrompt
+            withContext(Dispatchers.IO) {
+                runCatching { LiteRtSession.open(file, backend, cacheDir, systemPrompt) to backend }
                     .recoverCatching { e ->
                         // GPU が使えない端末では CPU にフォールバック
                         if (backend != BackendType.GPU) throw e
                         Log.w(TAG, "GPU init failed, falling back to CPU", e)
-                        releaseEngine()
-                        initEngine(file, BackendType.CPU)
+                        LiteRtSession.open(file, BackendType.CPU, cacheDir, systemPrompt) to BackendType.CPU
                     }
+                    .getOrThrow()
+                    .let { (session, used) -> session to used.name }
             }
-            result.onSuccess { (usedBackend, millis) ->
-                prefs.edit().putString(KEY_LAST_MODEL, file.name).apply()
-                _state.update {
-                    it.copy(modelState = ModelState.Ready(file.name, usedBackend, millis))
+        }
+    }
+
+    fun loadGeminiNano() {
+        open(GEMINI_NANO_NAME, "AICore", file = null) {
+            val session = GeminiNanoSession.open(_state.value.systemPrompt) { progress ->
+                _state.update { it.copy(modelState = ModelState.Loading(GEMINI_NANO_NAME, progress)) }
+            }
+            session to "AICore · ${session.baseModelName}"
+        }
+    }
+
+    /** 今のセッションを閉じて、新しいセッションを開く */
+    private fun open(
+        name: String,
+        backendLabel: String,
+        file: File?,
+        create: suspend () -> Pair<LlmSession, String>,
+    ) {
+        stopGeneration()
+        viewModelScope.launch {
+            generationJob?.join()
+            _state.update {
+                it.copy(modelState = ModelState.Loading(name, backendLabel), messages = emptyList())
+            }
+            withContext(Dispatchers.IO) {
+                session?.close()
+                session = null
+            }
+            val start = System.currentTimeMillis()
+            runCatching { create() }
+                .onSuccess { (opened, label) ->
+                    session = opened
+                    prefs.edit().putString(KEY_LAST_MODEL, name).apply()
+                    _state.update {
+                        it.copy(
+                            modelState = ModelState.Ready(
+                                name = name,
+                                backend = label,
+                                loadMillis = System.currentTimeMillis() - start,
+                                supportsImages = opened.supportsImages,
+                                file = file,
+                            ),
+                            pendingImage = it.pendingImage.takeIf { opened.supportsImages },
+                        )
+                    }
                 }
-            }.onFailure { e ->
-                Log.e(TAG, "load failed", e)
-                _state.update { it.copy(modelState = ModelState.Error("読み込みに失敗: ${e.message}")) }
+                .onFailure { e ->
+                    Log.e(TAG, "load failed", e)
+                    _state.update { it.copy(modelState = ModelState.Error("読み込みに失敗: ${e.message}")) }
+                }
+        }
+    }
+
+    /** カメラやギャラリーの画像を縮小して、次の発話に添付する */
+    fun attachImage(uri: Uri) {
+        viewModelScope.launch {
+            try {
+                val image = withContext(Dispatchers.IO) { loadImage(uri) }
+                _state.update { it.copy(pendingImage = image) }
+            } catch (e: Exception) {
+                Log.e(TAG, "image load failed", e)
+                _state.update {
+                    it.copy(messages = it.messages + ChatMessage(nextId++, Role.ERROR, "画像を読み込めませんでした: ${e.message}"))
+                }
             }
         }
     }
 
-    private fun initEngine(file: File, backend: BackendType): Pair<BackendType, Long> {
-        val start = System.currentTimeMillis()
-        val config = EngineConfig(
-            modelPath = file.absolutePath,
-            backend = when (backend) {
-                BackendType.GPU -> Backend.GPU()
-                BackendType.CPU -> Backend.CPU()
-            },
-            cacheDir = getApplication<Application>().cacheDir.path,
-        )
-        val e = Engine(config)
-        try {
-            e.initialize()
-            engine = e
-            conversation = e.createConversation(newConversationConfig())
-        } catch (t: Throwable) {
-            e.close()
-            engine = null
-            throw t
-        }
-        return backend to (System.currentTimeMillis() - start)
+    fun clearImage() {
+        _state.update { it.copy(pendingImage = null) }
     }
 
-    private fun newConversationConfig() = ConversationConfig(
-        systemInstruction = _state.value.systemPrompt.takeIf { it.isNotBlank() }?.let { Contents.of(it) },
-        // seed を指定しないと毎回同じ応答になるので、会話ごとに変える
-        samplerConfig = SamplerConfig(topK = 40, topP = 0.95, temperature = 0.8, seed = Random.nextInt()),
-        thinkingConfig = ThinkingConfig(enableThinking = false),
-    )
+    private fun loadImage(uri: Uri): PendingImage {
+        val source = ImageDecoder.createSource(getApplication<Application>().contentResolver, uri)
+        // ImageDecoder は EXIF の向きを反映してくれる。長辺を MAX_IMAGE_SIDE に縮める
+        val bitmap = ImageDecoder.decodeBitmap(source) { decoder, info, _ ->
+            val (w, h) = info.size.width to info.size.height
+            val scale = MAX_IMAGE_SIDE.toFloat() / maxOf(w, h)
+            if (scale < 1f) decoder.setTargetSize((w * scale).toInt(), (h * scale).toInt())
+            decoder.allocator = ImageDecoder.ALLOCATOR_SOFTWARE
+        }
+        val jpeg = ByteArrayOutputStream().use {
+            bitmap.compress(Bitmap.CompressFormat.JPEG, 90, it)
+            it.toByteArray()
+        }
+        return PendingImage(bitmap, jpeg)
+    }
 
     fun send(text: String) {
-        val prompt = text.trim()
+        val image = _state.value.pendingImage
+        val prompt = text.trim().ifEmpty { if (image != null) "この画像について教えてください。" else "" }
         if (prompt.isEmpty() || _state.value.generating) return
         if (_state.value.modelState !is ModelState.Ready) return
 
-        val userMsg = ChatMessage(nextId++, Role.USER, prompt)
+        val userMsg = ChatMessage(nextId++, Role.USER, prompt, image = image?.preview)
         val replyId = nextId++
         _state.update {
             it.copy(
                 messages = it.messages + userMsg + ChatMessage(replyId, Role.MODEL, "", streaming = true),
                 generating = true,
+                pendingImage = null,
             )
         }
 
         cancelRequested = false
         generationJob = viewModelScope.launch {
-            val conv = conversation ?: return@launch
+            val current = session ?: return@launch
             val start = System.currentTimeMillis()
             var firstTokenAt = 0L
             var chunks = 0
-            // Qwen3 の .litertlm に同梱のテンプレートは enable_thinking を無視するので、
-            // ユーザー発話末尾のソフトスイッチで思考を止める (システムプロンプトに入れると 2 ターン目以降効かない)
-            val modelName = (_state.value.modelState as? ModelState.Ready)?.name.orEmpty()
-            val input = if (modelName.contains("qwen3", ignoreCase = true)) "$prompt /no_think" else prompt
-            conv.sendMessageAsync(input)
+            current.generate(prompt, image)
                 .catch { e ->
                     if (cancelRequested) return@catch
                     Log.e(TAG, "generation failed", e)
@@ -242,9 +296,8 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                         it.copy(messages = it.messages + ChatMessage(nextId++, Role.ERROR, "エラー: ${e.message}"))
                     }
                 }
-                .collect { chunk ->
+                .collect { delta ->
                     if (chunks++ == 0) firstTokenAt = System.currentTimeMillis()
-                    val delta = chunk.toString()
                     updateReply(replyId) { it.copy(text = it.text + delta) }
                 }
             val end = System.currentTimeMillis()
@@ -261,25 +314,26 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     fun stopGeneration() {
         if (!_state.value.generating) return
         cancelRequested = true
-        conversation?.cancelProcess()
+        session?.cancel()
     }
 
     /** システムプロンプトは会話の作成時にしか渡せないので、変更したら会話をリセットする */
     fun setSystemPrompt(prompt: String) {
-        prefs.edit().putString(KEY_SYSTEM_PROMPT, prompt).apply()
+        // デフォルトのままなら保存しない (デフォルトを変えたときに追従させるため)
+        prefs.edit().apply {
+            if (prompt == DEFAULT_SYSTEM_PROMPT) remove(KEY_SYSTEM_PROMPT) else putString(KEY_SYSTEM_PROMPT, prompt)
+        }.apply()
         _state.update { it.copy(systemPrompt = prompt) }
-        if (engine != null) resetConversation()
+        if (session != null) resetConversation()
     }
 
     fun resetConversation() {
         stopGeneration()
         viewModelScope.launch {
             generationJob?.join()
-            withContext(engineDispatcher) {
-                conversation?.close()
-                conversation = engine?.createConversation(newConversationConfig())
-            }
-            _state.update { it.copy(messages = emptyList()) }
+            val systemPrompt = _state.value.systemPrompt
+            withContext(Dispatchers.IO) { session?.reset(systemPrompt) }
+            _state.update { it.copy(messages = emptyList(), pendingImage = null) }
         }
     }
 
@@ -289,21 +343,17 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    private fun releaseEngine() {
-        conversation?.close()
-        conversation = null
-        engine?.close()
-        engine = null
-    }
-
     override fun onCleared() {
-        conversation?.cancelProcess()
-        releaseEngine()
+        session?.cancel()
+        session?.close()
+        session = null
     }
 
     companion object {
         private const val TAG = "OnDeviceLlm"
         private const val KEY_SYSTEM_PROMPT = "system_prompt"
         private const val KEY_LAST_MODEL = "last_model"
+        private const val MAX_IMAGE_SIDE = 1024
+        const val GEMINI_NANO_NAME = "Gemini Nano"
     }
 }
