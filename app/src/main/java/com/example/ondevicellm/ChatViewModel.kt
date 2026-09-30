@@ -10,12 +10,17 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.io.ByteArrayOutputStream
 import java.io.File
@@ -77,6 +82,16 @@ private class QueuedSend(val prompt: String, val image: PendingImage?, val reply
 private object SessionHolder {
     var session: LlmSession? = null
     var ready: ModelState.Ready? = null
+
+    /**
+     * エンジンの読み込み・生成・会話のリセットを直列化するロック。
+     * 画面を開き直すと ViewModel が入れ替わるので、ViewModel ではなくプロセスで持つ
+     * (前の画面の生成が止まりきる前に次の画面がリセットする、読み込みが二重に走る、を防ぐ)
+     */
+    val lock = Mutex()
+
+    /** 最新の読み込み要求の番号。古い要求で開いたエンジンは使わずに閉じる */
+    var loadToken = 0L
 }
 
 class ChatViewModel(app: Application) : AndroidViewModel(app) {
@@ -235,53 +250,68 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         create: suspend () -> Pair<LlmSession, String>,
     ) {
         stopGeneration()
+        val token = ++SessionHolder.loadToken
         viewModelScope.launch {
             generationJob?.join()
             _state.update {
                 it.copy(modelState = ModelState.Loading(name, backendLabel), messages = emptyList(), generating = false)
             }
-            withContext(Dispatchers.IO) {
-                SessionHolder.ready = null
-                session?.close()
-                session = null
+            SessionHolder.lock.withLock {
+                // ロック待ちの間に新しい読み込みが来ていたら、そちらに任せる
+                if (token != SessionHolder.loadToken) return@launch
+                withContext(Dispatchers.IO) {
+                    SessionHolder.ready = null
+                    session?.close()
+                    session = null
+                }
+                val start = System.currentTimeMillis()
+                // 読み込み中に画面が閉じられても、開いたエンジンを取りこぼさずに閉じられるよう、キャンセルさせない
+                val result = withContext(NonCancellable) { runCatching { create() } }
+                if (!currentCoroutineContext().isActive || token != SessionHolder.loadToken) {
+                    result.getOrNull()?.first?.let { stale -> withContext(NonCancellable + Dispatchers.IO) { stale.close() } }
+                    return@launch
+                }
+                onOpened(result, name, file, start)
             }
-            val start = System.currentTimeMillis()
-            runCatching { create() }
-                .onSuccess { (opened, label) ->
-                    session = opened
-                    prefs.edit().putString(KEY_LAST_MODEL, name).apply()
-                    val ready = ModelState.Ready(
-                        name = name,
-                        backend = label,
-                        loadMillis = System.currentTimeMillis() - start,
-                        supportsImages = opened.supportsImages,
-                        file = file,
-                    )
-                    SessionHolder.ready = ready
-                    _state.update {
-                        it.copy(
-                            modelState = ready,
-                            pendingImage = it.pendingImage.takeIf { opened.supportsImages },
-                        )
-                    }
-                    // 読み込み中に送られていた発話があれば、ここで生成を始める
-                    queuedSend?.let { q ->
-                        queuedSend = null
-                        updateReply(q.replyId) { it.copy(queued = false) }
-                        generate(q.prompt, q.image?.takeIf { opened.supportsImages }, q.replyId)
-                    }
-                }
-                .onFailure { e ->
-                    Log.e(TAG, "load failed", e)
-                    queuedSend?.let { q ->
-                        queuedSend = null
-                        updateReply(q.replyId) {
-                            it.copy(role = Role.ERROR, text = "モデルを読み込めなかったので応答できませんでした", streaming = false, queued = false)
-                        }
-                    }
-                    _state.update { it.copy(modelState = ModelState.Error("読み込みに失敗: ${e.message}"), generating = false) }
-                }
         }
+    }
+
+    private fun onOpened(result: Result<Pair<LlmSession, String>>, name: String, file: File?, start: Long) {
+        result
+            .onSuccess { (opened, label) ->
+                session = opened
+                prefs.edit().putString(KEY_LAST_MODEL, name).apply()
+                val ready = ModelState.Ready(
+                    name = name,
+                    backend = label,
+                    loadMillis = System.currentTimeMillis() - start,
+                    supportsImages = opened.supportsImages,
+                    file = file,
+                )
+                SessionHolder.ready = ready
+                _state.update {
+                    it.copy(
+                        modelState = ready,
+                        pendingImage = it.pendingImage.takeIf { opened.supportsImages },
+                    )
+                }
+                // 読み込み中に送られていた発話があれば、ここで生成を始める
+                queuedSend?.let { q ->
+                    queuedSend = null
+                    updateReply(q.replyId) { it.copy(queued = false) }
+                    generate(q.prompt, q.image?.takeIf { opened.supportsImages }, q.replyId)
+                }
+            }
+            .onFailure { e ->
+                Log.e(TAG, "load failed", e)
+                queuedSend?.let { q ->
+                    queuedSend = null
+                    updateReply(q.replyId) {
+                        it.copy(role = Role.ERROR, text = "モデルを読み込めなかったので応答できませんでした", streaming = false, queued = false)
+                    }
+                }
+                _state.update { it.copy(modelState = ModelState.Error("読み込みに失敗: ${e.message}"), generating = false) }
+            }
     }
 
     /** カメラやギャラリーの画像を縮小して、次の発話に添付する */
@@ -345,31 +375,35 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     private fun generate(prompt: String, image: PendingImage?, replyId: Long) {
         cancelRequested = false
         generationJob = viewModelScope.launch {
-            val current = session ?: return@launch
-            val start = System.currentTimeMillis()
-            var firstTokenAt = 0L
-            var chunks = 0
-            current.generate(prompt, image)
-                .catch { e ->
-                    if (cancelRequested) return@catch
-                    Log.e(TAG, "generation failed", e)
-                    _state.update {
-                        it.copy(messages = it.messages + ChatMessage(nextId++, Role.ERROR, "エラー: ${e.message}"))
-                    }
-                }
-                .collect { delta ->
-                    if (chunks++ == 0) firstTokenAt = System.currentTimeMillis()
-                    updateReply(replyId) { it.copy(text = it.text + delta) }
-                }
-            val end = System.currentTimeMillis()
-            val stats = if (chunks > 0) {
-                val ttft = firstTokenAt - start
-                val decodeSec = (end - firstTokenAt).coerceAtLeast(1) / 1000.0
-                "初回 %.2fs · %.1f chunk/s · 合計 %.1fs".format(ttft / 1000.0, (chunks - 1) / decodeSec, (end - start) / 1000.0)
-            } else null
-            updateReply(replyId) { it.copy(streaming = false, stats = stats) }
-            _state.update { it.copy(generating = false) }
+            SessionHolder.lock.withLock { generateLocked(prompt, replyId, image) }
         }
+    }
+
+    private suspend fun generateLocked(prompt: String, replyId: Long, image: PendingImage?) {
+        val current = session ?: return
+        val start = System.currentTimeMillis()
+        var firstTokenAt = 0L
+        var chunks = 0
+        current.generate(prompt, image)
+            .catch { e ->
+                if (cancelRequested) return@catch
+                Log.e(TAG, "generation failed", e)
+                _state.update {
+                    it.copy(messages = it.messages + ChatMessage(nextId++, Role.ERROR, "エラー: ${e.message}"))
+                }
+            }
+            .collect { delta ->
+                if (chunks++ == 0) firstTokenAt = System.currentTimeMillis()
+                updateReply(replyId) { it.copy(text = it.text + delta) }
+            }
+        val end = System.currentTimeMillis()
+        val stats = if (chunks > 0) {
+            val ttft = firstTokenAt - start
+            val decodeSec = (end - firstTokenAt).coerceAtLeast(1) / 1000.0
+            "初回 %.2fs · %.1f chunk/s · 合計 %.1fs".format(ttft / 1000.0, (chunks - 1) / decodeSec, (end - start) / 1000.0)
+        } else null
+        updateReply(replyId) { it.copy(streaming = false, stats = stats) }
+        _state.update { it.copy(generating = false) }
     }
 
     fun stopGeneration() {
@@ -399,7 +433,9 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch {
             generationJob?.join()
             val systemPrompt = _state.value.systemPrompt
-            withContext(Dispatchers.IO) { session?.reset(systemPrompt) }
+            SessionHolder.lock.withLock {
+                withContext(Dispatchers.IO) { session?.reset(systemPrompt) }
+            }
             _state.update { it.copy(messages = emptyList(), pendingImage = null) }
         }
     }
