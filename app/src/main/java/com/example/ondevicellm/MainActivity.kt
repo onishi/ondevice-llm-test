@@ -254,9 +254,10 @@ fun ChatScreen(vm: ChatViewModel = viewModel()) {
                 Column {
                     TextButton(
                         onClick = { showModelDialog = false; vm.loadGeminiNano() },
+                        enabled = state.geminiNanoAvailable == true,
                         modifier = Modifier.fillMaxWidth(),
                     ) {
-                        Text("Gemini Nano  (端末内蔵 · AICore)", modifier = Modifier.fillMaxWidth())
+                        Text(geminiNanoLabel(state.geminiNanoAvailable), modifier = Modifier.fillMaxWidth())
                     }
                     state.availableModels.forEach { f ->
                         TextButton(
@@ -318,6 +319,12 @@ private fun SystemPromptDialog(initial: String, onDismiss: () -> Unit, onSave: (
     )
 }
 
+private fun geminiNanoLabel(available: Boolean?) = when (available) {
+    null -> "Gemini Nano  (確認中…)"
+    true -> "Gemini Nano  (端末内蔵)"
+    false -> "Gemini Nano  (この端末では使えません)"
+}
+
 private fun statusText(ms: ModelState): String = when (ms) {
     ModelState.NotLoaded -> "モデル未読み込み"
     is ModelState.Copying -> "取り込み中 ${(ms.progress * 100).toInt()}%: ${ms.name}"
@@ -355,8 +362,12 @@ private fun EmptyState(
                 }
                 Text("使うモデルを選んでください", style = MaterialTheme.typography.titleMedium)
                 Spacer(Modifier.height(16.dp))
-                Button(onClick = onLoadGeminiNano, modifier = Modifier.fillMaxWidth()) {
-                    Text("Gemini Nano  (端末内蔵)")
+                Button(
+                    onClick = onLoadGeminiNano,
+                    enabled = state.geminiNanoAvailable == true,
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Text(geminiNanoLabel(state.geminiNanoAvailable))
                 }
                 Spacer(Modifier.height(8.dp))
                 state.availableModels.forEach { f ->

@@ -1,5 +1,6 @@
 package com.example.ondevicellm
 
+import android.util.Log
 import com.google.ai.edge.litertlm.Backend
 import com.google.ai.edge.litertlm.Capabilities
 import com.google.ai.edge.litertlm.Content
@@ -16,9 +17,13 @@ import com.google.mlkit.genai.common.FeatureStatus
 import com.google.mlkit.genai.prompt.GenerativeModel
 import com.google.mlkit.genai.prompt.Generation
 import com.google.mlkit.genai.prompt.ImagePart
+import com.google.mlkit.genai.prompt.ModelPreference
+import com.google.mlkit.genai.prompt.ModelReleaseStage
 import com.google.mlkit.genai.prompt.SystemInstruction
 import com.google.mlkit.genai.prompt.TextPart
 import com.google.mlkit.genai.prompt.generateContentRequest
+import com.google.mlkit.genai.prompt.generationConfig
+import com.google.mlkit.genai.prompt.modelConfig
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.map
@@ -195,14 +200,55 @@ class GeminiNanoSession private constructor(
 
     companion object {
         private const val HISTORY_CHAR_BUDGET = 3000
+        private const val TAG = "OnDeviceLlm"
+
+        /**
+         * 端末によって提供されている Gemini Nano の種類が違う (例: Pixel 10a は既定の STABLE×FULL が無い) ので、
+         * 性能の高い順に試して最初に使えるものを選ぶ
+         */
+        private val CANDIDATES = listOf(
+            ModelReleaseStage.STABLE to ModelPreference.FULL,
+            ModelReleaseStage.STABLE to ModelPreference.FAST,
+            ModelReleaseStage.PREVIEW to ModelPreference.FULL,
+            ModelReleaseStage.PREVIEW to ModelPreference.FAST,
+        )
+
+        private fun label(stage: Int, preference: Int) =
+            (if (stage == ModelReleaseStage.STABLE) "STABLE" else "PREVIEW") + "×" +
+                (if (preference == ModelPreference.FULL) "FULL" else "FAST")
+
+        /** 使える構成のクライアントを返す。見つからなければ各構成のエラーをまとめて投げる */
+        private suspend fun findAvailableModel(): Pair<GenerativeModel, String> {
+            val errors = mutableListOf<String>()
+            for ((stage, preference) in CANDIDATES) {
+                val name = label(stage, preference)
+                val model = Generation.getClient(generationConfig {
+                    modelConfig = modelConfig {
+                        releaseStage = stage
+                        this.preference = preference
+                    }
+                })
+                val status = runCatching { model.checkStatus() }
+                Log.i(TAG, "Gemini Nano $name: ${status.getOrNull() ?: status.exceptionOrNull()}")
+                if (status.getOrNull()?.let { it != FeatureStatus.UNAVAILABLE } == true) return model to name
+                errors += "$name: " + (status.exceptionOrNull()?.message ?: "UNAVAILABLE")
+                model.close()
+            }
+            throw IllegalStateException("この端末では Gemini Nano を使えません\n" + errors.joinToString("\n"))
+        }
+
+        /** この端末で Gemini Nano を使えるか (未ダウンロードでもダウンロードできれば true) */
+        suspend fun isAvailable(): Boolean = try {
+            findAvailableModel().first.close()
+            true
+        } catch (e: Exception) {
+            false
+        }
 
         suspend fun open(systemPrompt: String, onProgress: (String) -> Unit): GeminiNanoSession {
-            val model = Generation.getClient()
+            val (model, configName) = findAvailableModel()
             try {
                 when (model.checkStatus()) {
-                    FeatureStatus.UNAVAILABLE -> throw IllegalStateException(
-                        "この端末では Gemini Nano を使えません (非対応機種、または AICore の設定がまだ取得されていない可能性があります)"
-                    )
                     FeatureStatus.DOWNLOADABLE, FeatureStatus.DOWNLOADING -> model.download().collect { status ->
                         when (status) {
                             is DownloadStatus.DownloadProgress ->
@@ -214,7 +260,8 @@ class GeminiNanoSession private constructor(
                 }
                 onProgress("準備中")
                 model.warmup()
-                val name = runCatching { model.getBaseModelName() }.getOrNull()?.takeIf { it.isNotBlank() } ?: "Gemini Nano"
+                val name = (runCatching { model.getBaseModelName() }.getOrNull()?.takeIf { it.isNotBlank() } ?: "Gemini Nano") +
+                    " ($configName)"
                 val systemOk = runCatching { model.isSystemPromptAvailable() }.getOrDefault(false)
                 return GeminiNanoSession(model, systemPrompt, systemOk, name)
             } catch (t: Throwable) {

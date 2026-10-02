@@ -68,6 +68,8 @@ data class ChatUiState(
     val systemPrompt: String = DEFAULT_SYSTEM_PROMPT,
     /** 次の発話に添付する画像 */
     val pendingImage: PendingImage? = null,
+    /** この端末で Gemini Nano を使えるか。null は確認中 */
+    val geminiNanoAvailable: Boolean? = null,
 )
 
 class PendingImage(val preview: Bitmap, val jpeg: ByteArray)
@@ -127,6 +129,10 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             )
         }
         refreshModels()
+        viewModelScope.launch {
+            val available = GeminiNanoSession.isAvailable()
+            _state.update { it.copy(geminiNanoAvailable = available) }
+        }
         // 同じプロセスで読み込み済みなら使い回す (画面側の会話は消えているので、エンジン側の履歴も捨てる)
         val alive = SessionHolder.ready
         if (alive != null && session != null) {
